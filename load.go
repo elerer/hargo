@@ -64,6 +64,7 @@ func processEntries(harfile string, har *Har, wg *sync.WaitGroup, wid int, c cli
 
 		httpClient := http.Client{
 			Transport: &http.Transport{
+				Proxy:http.ProxyFromEnvironment,
 				Dial: (&net.Dialer{
 					Timeout:   30 * time.Second,
 					KeepAlive: 30 * time.Second,
