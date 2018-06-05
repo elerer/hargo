@@ -56,73 +56,48 @@ func processEntries(harfile string, har *Har, wg *sync.WaitGroup, wid int, c cli
 
 	iter := 0
 
-	for {
+	testResults := make([]TestResult, 0) // batch results
 
-		testResults := make([]TestResult, 0) // batch results
+	jar, _ := cookiejar.New(nil)
 
-		jar, _ := cookiejar.New(nil)
+	httpClient := http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			Dial: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).Dial,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Jar: jar,
+	}
 
-		httpClient := http.Client{
-			Transport: &http.Transport{
-				Proxy:http.ProxyFromEnvironment,
-				Dial: (&net.Dialer{
-					Timeout:   30 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).Dial,
-				TLSHandshakeTimeout:   10 * time.Second,
-				ResponseHeaderTimeout: 10 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
-			},
-			CheckRedirect: func(r *http.Request, via []*http.Request) error {
-				r.URL.Opaque = r.URL.Path
-				return nil
-			},
-			Jar: jar,
-		}
+	for _, entry := range har.Log.Entries {
 
-		for _, entry := range har.Log.Entries {
+		msg := fmt.Sprintf("[%d,%d] %s", wid, iter, entry.Request.URL)
 
-			msg := fmt.Sprintf("[%d,%d] %s", wid, iter, entry.Request.URL)
+		req, err := EntryToRequest(&entry, ignoreHarCookies)
 
-			req, err := EntryToRequest(&entry, ignoreHarCookies)
+		check(err)
 
-			check(err)
+		jar.SetCookies(req.URL, req.Cookies())
 
-			jar.SetCookies(req.URL, req.Cookies())
+		startTime := time.Now()
+		resp, err := httpClient.Do(req)
+		endTime := time.Now()
+		latency := int(endTime.Sub(startTime) / time.Millisecond)
+		method := req.Method
 
-			startTime := time.Now()
-			resp, err := httpClient.Do(req)
-			endTime := time.Now()
-			latency := int(endTime.Sub(startTime) / time.Millisecond)
-			method := req.Method
-
-			if err != nil {
-				log.Error(err)
-				tr := TestResult{
-					URL:       req.URL.String(),
-					Status:    0,
-					StartTime: startTime,
-					EndTime:   endTime,
-					Latency:   latency,
-					Method:    method,
-					HarFile:   harfile}
-
-				testResults = append(testResults, tr)
-
-				continue
-			}
-
-			if resp != nil {
-				resp.Body.Close()
-			}
-
-			msg += fmt.Sprintf(" %d %dms", resp.StatusCode, latency)
-
-			log.Debug(msg)
-
+		if err != nil {
+			log.Error(err)
 			tr := TestResult{
 				URL:       req.URL.String(),
-				Status:    resp.StatusCode,
+				Status:    0,
 				StartTime: startTime,
 				EndTime:   endTime,
 				Latency:   latency,
@@ -130,15 +105,40 @@ func processEntries(harfile string, har *Har, wg *sync.WaitGroup, wid int, c cli
 				HarFile:   harfile}
 
 			testResults = append(testResults, tr)
+
+			continue
 		}
 
-		if useInfluxDB {
-			log.Debug("Writing batch points to InfluxDB...")
-			go WritePoints(c, testResults)
+		if resp != nil {
+			resp.Body.Close()
 		}
 
-		iter++
+		msg += fmt.Sprintf(" %d %dms", resp.StatusCode, latency)
+
+		log.Debug(msg)
+
+		tr := TestResult{
+			URL:       req.URL.String(),
+			Status:    resp.StatusCode,
+			StartTime: startTime,
+			EndTime:   endTime,
+			Latency:   latency,
+			Method:    method,
+			HarFile:   harfile}
+
+		testResults = append(testResults, tr)
 	}
+
+	if useInfluxDB {
+		log.Debug("Writing batch points to InfluxDB...")
+		go WritePoints(c, testResults)
+	}
+
+	for _, ts := range testResults {
+		fmt.Println(ts)
+	}
+	iter++
+
 }
 
 // waitTimeout waits for the waitgroup for the specified max timeout.
