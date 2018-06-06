@@ -18,7 +18,7 @@ var useInfluxDB = true // just in case we can't connect, run tests without recor
 
 // LoadTest executes all HTTP requests in order concurrently
 // for a given number of workers.
-func LoadTest(harfile string, r *bufio.Reader, workers int, timeout time.Duration, u url.URL, ignoreHarCookies bool) error {
+func LoadTest(harfile string, r *bufio.Reader, workers int, timeout time.Duration, u url.URL, ignoreHarCookies bool, isHartest bool) error {
 
 	c, err := NewInfluxDBClient(u)
 
@@ -39,7 +39,7 @@ func LoadTest(harfile string, r *bufio.Reader, workers int, timeout time.Duratio
 
 	for i := 0; i < workers; i++ {
 		wg.Add(workers)
-		go processEntries(harfile, &har, &wg, i, c, ignoreHarCookies)
+		go processEntries(harfile, &har, &wg, i, c, ignoreHarCookies, isHartest)
 	}
 
 	if waitTimeout(&wg, timeout) {
@@ -51,53 +51,77 @@ func LoadTest(harfile string, r *bufio.Reader, workers int, timeout time.Duratio
 	return nil
 }
 
-func processEntries(harfile string, har *Har, wg *sync.WaitGroup, wid int, c client.Client, ignoreHarCookies bool) {
+func processEntries(harfile string, har *Har, wg *sync.WaitGroup, wid int, c client.Client, ignoreHarCookies bool,isHartest bool) {
 	defer wg.Done()
 
 	iter := 0
 
-	testResults := make([]TestResult, 0) // batch results
+	for {
 
-	jar, _ := cookiejar.New(nil)
+		testResults := make([]TestResult, 0) // batch results
 
-	httpClient := http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			Dial: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).Dial,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-		Jar: jar,
-	}
+		jar, _ := cookiejar.New(nil)
 
-	for _, entry := range har.Log.Entries {
+		httpClient := http.Client{
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				Dial: (&net.Dialer{
+					Timeout:   30 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).Dial,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+			Jar: jar,
+		}
 
-		msg := fmt.Sprintf("[%d,%d] %s", wid, iter, entry.Request.URL)
+		for _, entry := range har.Log.Entries {
 
-		req, err := EntryToRequest(&entry, ignoreHarCookies)
+			msg := fmt.Sprintf("[%d,%d] %s", wid, iter, entry.Request.URL)
 
-		check(err)
+			req, err := EntryToRequest(&entry, ignoreHarCookies)
 
-		jar.SetCookies(req.URL, req.Cookies())
+			check(err)
 
-		startTime := time.Now()
-		resp, err := httpClient.Do(req)
-		endTime := time.Now()
-		latency := int(endTime.Sub(startTime) / time.Millisecond)
-		method := req.Method
+			jar.SetCookies(req.URL, req.Cookies())
 
-		if err != nil {
-			log.Error(err)
+			startTime := time.Now()
+			resp, err := httpClient.Do(req)
+			endTime := time.Now()
+			latency := int(endTime.Sub(startTime) / time.Millisecond)
+			method := req.Method
+
+			if err != nil {
+				log.Error(err)
+				tr := TestResult{
+					URL:       req.URL.String(),
+					Status:    0,
+					StartTime: startTime,
+					EndTime:   endTime,
+					Latency:   latency,
+					Method:    method,
+					HarFile:   harfile}
+
+				testResults = append(testResults, tr)
+
+				continue
+			}
+
+			if resp != nil {
+				resp.Body.Close()
+			}
+
+			msg += fmt.Sprintf(" %d %dms", resp.StatusCode, latency)
+
+			log.Debug(msg)
+
 			tr := TestResult{
 				URL:       req.URL.String(),
-				Status:    0,
+				Status:    resp.StatusCode,
 				StartTime: startTime,
 				EndTime:   endTime,
 				Latency:   latency,
@@ -105,39 +129,21 @@ func processEntries(harfile string, har *Har, wg *sync.WaitGroup, wid int, c cli
 				HarFile:   harfile}
 
 			testResults = append(testResults, tr)
-
-			continue
 		}
 
-		if resp != nil {
-			resp.Body.Close()
+		if useInfluxDB {
+			log.Debug("Writing batch points to InfluxDB...")
+			go WritePoints(c, testResults)
 		}
 
-		msg += fmt.Sprintf(" %d %dms", resp.StatusCode, latency)
-
-		log.Debug(msg)
-
-		tr := TestResult{
-			URL:       req.URL.String(),
-			Status:    resp.StatusCode,
-			StartTime: startTime,
-			EndTime:   endTime,
-			Latency:   latency,
-			Method:    method,
-			HarFile:   harfile}
-
-		testResults = append(testResults, tr)
+		if isHartest {
+			for _, ts := range testResults {
+				fmt.Println(ts)
+			}
+			break
+		}
+		iter++
 	}
-
-	if useInfluxDB {
-		log.Debug("Writing batch points to InfluxDB...")
-		go WritePoints(c, testResults)
-	}
-
-	for _, ts := range testResults {
-		fmt.Println(ts)
-	}
-	iter++
 
 }
 
