@@ -51,10 +51,12 @@ func LoadTest(harfile string, r *bufio.Reader, workers int, timeout time.Duratio
 	return nil
 }
 
-func processEntries(harfile string, har *Har, wg *sync.WaitGroup, wid int, c client.Client, ignoreHarCookies bool,isHartest bool) {
+func processEntries(harfile string, har *Har, wg *sync.WaitGroup, wid int, c client.Client, ignoreHarCookies bool, isHartest bool) {
 	defer wg.Done()
 
 	iter := 0
+
+	var resChan chan *MismatchTransaction
 
 	for {
 
@@ -78,6 +80,8 @@ func processEntries(harfile string, har *Har, wg *sync.WaitGroup, wid int, c cli
 			},
 			Jar: jar,
 		}
+
+		resChan = make(chan *MismatchTransaction, len(har.Log.Entries))
 
 		for _, entry := range har.Log.Entries {
 
@@ -128,6 +132,9 @@ func processEntries(harfile string, har *Har, wg *sync.WaitGroup, wid int, c cli
 				Method:    method,
 				HarFile:   harfile}
 
+			if isHartest {
+				go CompareHarVsTestResp(entry, resp, resChan)
+			}
 			testResults = append(testResults, tr)
 		}
 
@@ -137,12 +144,33 @@ func processEntries(harfile string, har *Har, wg *sync.WaitGroup, wid int, c cli
 		}
 
 		if isHartest {
-			for _, ts := range testResults {
-				fmt.Println(ts)
-			}
+			//for _, ts := range testResults {
+				//fmt.Println(ts)
+			//}
 			break
 		}
+
 		iter++
+	}
+
+	if i := len(resChan); i > 0 {
+		fmt.Println("HAR test - %d requests mismatch from original", i)
+		for elem := range resChan {
+			fmt.Println("-----------------------------------------------")
+			fmt.Println(elem)
+
+		}
+	}
+
+}
+
+func CompareHarVsTestResp(harEntry Entry, testResponse *http.Response, badReqChan chan *MismatchTransaction) {
+		if harEntry.Response.Status != testResponse.StatusCode {
+		badReqChan <- &MismatchTransaction{
+			harStatusint:harEntry.Response.Status,
+			testProxyStatusCode:testResponse.StatusCode,
+			url:harEntry.Request.URL,
+		}
 	}
 
 }

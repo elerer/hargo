@@ -337,3 +337,9 @@ type TestResult struct {
 	Method    string    `json:"method"`
 	HarFile   string    `json:"harfile"`
 }
+
+type MismatchTransaction struct {
+	harStatusint        int
+	testProxyStatusCode int
+	url                 string
+}
