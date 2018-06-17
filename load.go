@@ -5,141 +5,120 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
-	"net/url"
+	"sync"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
-	client "github.com/influxdata/influxdb/client/v2"
 )
 
-var useInfluxDB = true // just in case we can't connect, run tests without recording results
+var useInfluxDB = false // just in case we can't connect, run tests without recording results
 
 // LoadTest executes all HTTP requests in order concurrently
 // for a given number of workers.
-func LoadTest(harfile string, har Har, u url.URL, ignoreHarCookies bool, isHartest bool, ch chan int) error {
+func LoadTest(harfile string, har Har, ignoreHarCookies bool, isHartest bool, ch chan int, wg *sync.WaitGroup) error {
+	fmt.Println("LoadTest")
 
-	c, err := NewInfluxDBClient(u)
-
-	if err != nil {
-		useInfluxDB = false
-		log.Warn("No test results will be recorded to InfluxDB")
-	} else {
-		log.Info("Recording results to InfluxDB: ", u.String())
-	}
-
-	check(err)
-
-	go processEntries(harfile, har, c, ignoreHarCookies, isHartest, ch)
+	go processEntries(harfile, har, ignoreHarCookies, isHartest, ch, wg)
 
 	return nil
 }
 
-func processEntries(harfile string, har Har, c client.Client, ignoreHarCookies bool, isHartest bool, ch chan int) {
+func processEntries(harfile string, har Har, ignoreHarCookies bool, isHartest bool, ch chan int, wg *sync.WaitGroup) {
 
-	defer func(ch chan int) { <-ch }(ch)
+	fmt.Println("***************************processEntries")
+
+	defer func(ch chan int) {
+		<-ch
+		//wg.Done()
+	}(ch)
 
 	iter := 0
 
 	var resChan chan *MismatchTransaction
 
-	for {
+	testResults := make([]TestResult, 0) // batch results
 
-		testResults := make([]TestResult, 0) // batch results
+	jar, _ := cookiejar.New(nil)
 
-		jar, _ := cookiejar.New(nil)
+	httpClient := http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			Dial: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).Dial,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Jar: jar,
+	}
 
-		httpClient := http.Client{
-			Transport: &http.Transport{
-				Proxy: http.ProxyFromEnvironment,
-				Dial: (&net.Dialer{
-					Timeout:   30 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).Dial,
-				TLSHandshakeTimeout:   10 * time.Second,
-				ResponseHeaderTimeout: 10 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
-			},
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-			Jar: jar,
-		}
+	var chanLen int
 
-		var chanLen int
+	chanLen += len(har.Log.Entries)
 
-		chanLen += len(har.Log.Entries)
+	resChan = make(chan *MismatchTransaction, chanLen)
 
-		resChan = make(chan *MismatchTransaction, chanLen)
+	for _, entry := range har.Log.Entries {
 
-		for _, entry := range har.Log.Entries {
+		msg := fmt.Sprintf("[%d] %s", iter, entry.Request.URL)
 
-			msg := fmt.Sprintf("[%d] %s", iter, entry.Request.URL)
+		req, err := EntryToRequest(&entry, ignoreHarCookies)
 
-			req, err := EntryToRequest(&entry, ignoreHarCookies)
+		check(err)
 
-			check(err)
+		jar.SetCookies(req.URL, req.Cookies())
 
-			jar.SetCookies(req.URL, req.Cookies())
+		startTime := time.Now()
+		resp, err := httpClient.Do(req)
+		endTime := time.Now()
+		latency := int(endTime.Sub(startTime) / time.Millisecond)
+		method := req.Method
 
-			startTime := time.Now()
-			resp, err := httpClient.Do(req)
-			endTime := time.Now()
-			latency := int(endTime.Sub(startTime) / time.Millisecond)
-			method := req.Method
-
-			if err != nil {
-				log.Error(err)
-				tr := TestResult{
-					URL:       req.URL.String(),
-					Status:    0,
-					StartTime: startTime,
-					EndTime:   endTime,
-					Latency:   latency,
-					Method:    method,
-					HarFile:   harfile}
-
-				testResults = append(testResults, tr)
-
-				continue
-			}
-
-			if resp != nil {
-				resp.Body.Close()
-			}
-
-			msg += fmt.Sprintf(" %d %dms", resp.StatusCode, latency)
-
-			log.Debug(msg)
-
+		if err != nil {
+			log.Error(err)
 			tr := TestResult{
 				URL:       req.URL.String(),
-				Status:    resp.StatusCode,
+				Status:    0,
 				StartTime: startTime,
 				EndTime:   endTime,
 				Latency:   latency,
 				Method:    method,
 				HarFile:   harfile}
 
-			if isHartest {
-				go CompareHarVsTestResp(entry, resp, resChan)
-			}
 			testResults = append(testResults, tr)
+
+			continue
 		}
 
-		if useInfluxDB {
-			log.Debug("Writing batch points to InfluxDB...")
-			go WritePoints(c, testResults)
+		if resp != nil {
+			resp.Body.Close()
 		}
+
+		msg += fmt.Sprintf(" %d %dms", resp.StatusCode, latency)
+
+		log.Debug(msg)
+
+		tr := TestResult{
+			URL:       req.URL.String(),
+			Status:    resp.StatusCode,
+			StartTime: startTime,
+			EndTime:   endTime,
+			Latency:   latency,
+			Method:    method,
+			HarFile:   harfile}
 
 		if isHartest {
-			//for _, ts := range testResults {
-			//fmt.Println(ts)
-			//}
-			break
+			go CompareHarVsTestResp(entry, resp, resChan)
 		}
-
-		iter++
+		testResults = append(testResults, tr)
 	}
+
+	iter++
 
 	if i := len(resChan); i > 0 {
 		fmt.Println("HAR test - %d requests mismatch from original", i)
@@ -149,6 +128,8 @@ func processEntries(harfile string, har Har, c client.Client, ignoreHarCookies b
 
 		}
 	}
+
+	fmt.Println("39845948594859485948598459845849758465846584")
 
 }
 
