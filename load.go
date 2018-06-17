@@ -1,13 +1,11 @@
 package hargo
 
 import (
-	"bufio"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"sync"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
@@ -18,7 +16,7 @@ var useInfluxDB = true // just in case we can't connect, run tests without recor
 
 // LoadTest executes all HTTP requests in order concurrently
 // for a given number of workers.
-func LoadTest(harfile string, r *bufio.Reader, workers int, timeout time.Duration, u url.URL, ignoreHarCookies bool, isHartest bool) error {
+func LoadTest(harfile string, har Har, u url.URL, ignoreHarCookies bool, isHartest bool, ch chan int) error {
 
 	c, err := NewInfluxDBClient(u)
 
@@ -29,30 +27,16 @@ func LoadTest(harfile string, r *bufio.Reader, workers int, timeout time.Duratio
 		log.Info("Recording results to InfluxDB: ", u.String())
 	}
 
-	har, err := Decode(r)
-
 	check(err)
 
-	var wg sync.WaitGroup
-
-	log.Infof("Starting load test with %d workers. Duration %v.", workers, timeout)
-
-	for i := 0; i < workers; i++ {
-		wg.Add(workers)
-		go processEntries(harfile, &har, &wg, i, c, ignoreHarCookies, isHartest)
-	}
-
-	if waitTimeout(&wg, timeout) {
-		fmt.Printf("\nTimeout of %.1fs elapsed. Terminating load test.\n", timeout.Seconds())
-	} else {
-		fmt.Println("Wait group finished")
-	}
+	go processEntries(harfile, har, c, ignoreHarCookies, isHartest, ch)
 
 	return nil
 }
 
-func processEntries(harfile string, har *Har, wg *sync.WaitGroup, wid int, c client.Client, ignoreHarCookies bool, isHartest bool) {
-	defer wg.Done()
+func processEntries(harfile string, har Har, c client.Client, ignoreHarCookies bool, isHartest bool, ch chan int) {
+
+	defer func(ch chan int) { <-ch }(ch)
 
 	iter := 0
 
@@ -81,11 +65,15 @@ func processEntries(harfile string, har *Har, wg *sync.WaitGroup, wid int, c cli
 			Jar: jar,
 		}
 
-		resChan = make(chan *MismatchTransaction, len(har.Log.Entries))
+		var chanLen int
+
+		chanLen += len(har.Log.Entries)
+
+		resChan = make(chan *MismatchTransaction, chanLen)
 
 		for _, entry := range har.Log.Entries {
 
-			msg := fmt.Sprintf("[%d,%d] %s", wid, iter, entry.Request.URL)
+			msg := fmt.Sprintf("[%d] %s", iter, entry.Request.URL)
 
 			req, err := EntryToRequest(&entry, ignoreHarCookies)
 
@@ -145,7 +133,7 @@ func processEntries(harfile string, har *Har, wg *sync.WaitGroup, wid int, c cli
 
 		if isHartest {
 			//for _, ts := range testResults {
-				//fmt.Println(ts)
+			//fmt.Println(ts)
 			//}
 			break
 		}
@@ -165,28 +153,12 @@ func processEntries(harfile string, har *Har, wg *sync.WaitGroup, wid int, c cli
 }
 
 func CompareHarVsTestResp(harEntry Entry, testResponse *http.Response, badReqChan chan *MismatchTransaction) {
-		if harEntry.Response.Status != testResponse.StatusCode {
+	if harEntry.Response.Status != testResponse.StatusCode {
 		badReqChan <- &MismatchTransaction{
-			harStatusint:harEntry.Response.Status,
-			testProxyStatusCode:testResponse.StatusCode,
-			url:harEntry.Request.URL,
+			harStatusint:        harEntry.Response.Status,
+			testProxyStatusCode: testResponse.StatusCode,
+			url:                 harEntry.Request.URL,
 		}
 	}
 
-}
-
-// waitTimeout waits for the waitgroup for the specified max timeout.
-// Returns true if waiting timed out.
-func waitTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
-	c := make(chan struct{})
-	go func() {
-		defer close(c)
-		wg.Wait()
-	}()
-	select {
-	case <-c:
-		return false // completed normally
-	case <-time.After(timeout):
-		return true // timed out
-	}
 }
